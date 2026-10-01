@@ -66,10 +66,41 @@ and two directions (forward and reverse) for a total of six combinations.
 from django.core.exceptions import FieldError
 from django.db import connections, router, transaction
 from django.db.models import Q, signals
+from django.db.models.expressions import Window
+from django.db.models.functions import RowNumber
+from django.db.models.lookups import GreaterThan, LessThanOrEqual
 from django.db.models.query import QuerySet
 from django.db.models.query_utils import DeferredAttribute
 from django.db.models.utils import resolve_callables
 from django.utils.functional import cached_property
+
+
+def _filter_prefetch_queryset(queryset, predicate, partition_by):
+    """
+    Filter a prefetch queryset with ``predicate``, the condition restricting
+    it to the related objects of the instances being prefetched for.
+
+    Sliced querysets can't be filtered, and applying the slice to the combined
+    query would limit the total number of results rather than the number of
+    results per instance. Instead, the slice is replaced by a filter against
+    a ROW_NUMBER() window partitioned by ``partition_by`` and following the
+    queryset's ordering, so that the slice applies to each instance.
+    """
+    if queryset.query.is_sliced:
+        # Clone to avoid clearing the limits of the queryset provided by the
+        # user (e.g. the Prefetch() queryset).
+        queryset = queryset._chain()
+        low_mark, high_mark = queryset.query.low_mark, queryset.query.high_mark
+        order_by = [
+            expr for expr, _ in queryset.query.get_compiler(queryset.db).get_order_by()
+        ]
+        window = Window(RowNumber(), partition_by=partition_by, order_by=order_by)
+        if low_mark:
+            predicate &= GreaterThan(window, low_mark)
+        if high_mark is not None:
+            predicate &= LessThanOrEqual(window, high_mark)
+        queryset.query.clear_limits()
+    return queryset.filter(predicate)
 
 
 class ForeignKeyDeferredAttribute(DeferredAttribute):
@@ -139,13 +170,14 @@ class ForwardManyToOneDescriptor:
         # The check for len(...) == 1 is a special case that allows the query
         # to be join-less and smaller. Refs #21760.
         if remote_field.is_hidden() or len(self.field.foreign_related_fields) == 1:
+            field_name = related_field.name
             query = {
-                "%s__in"
-                % related_field.name: {instance_attr(inst)[0] for inst in instances}
+                "%s__in" % field_name: {instance_attr(inst)[0] for inst in instances}
             }
         else:
-            query = {"%s__in" % self.field.related_query_name(): instances}
-        queryset = queryset.filter(**query)
+            field_name = self.field.related_query_name()
+            query = {"%s__in" % field_name: instances}
+        queryset = _filter_prefetch_queryset(queryset, Q(**query), field_name)
 
         # Since we're going to assign directly in the cache,
         # we must manage the reverse relation cache manually.
@@ -403,8 +435,9 @@ class ReverseOneToOneDescriptor:
         rel_obj_attr = self.related.field.get_local_related_value
         instance_attr = self.related.field.get_foreign_related_value
         instances_dict = {instance_attr(inst): inst for inst in instances}
-        query = {"%s__in" % self.related.field.name: instances}
-        queryset = queryset.filter(**query)
+        field_name = self.related.field.name
+        query = {"%s__in" % field_name: instances}
+        queryset = _filter_prefetch_queryset(queryset, Q(**query), field_name)
 
         # Since we're going to assign directly in the cache,
         # we must manage the reverse relation cache manually.
@@ -719,7 +752,7 @@ def create_reverse_many_to_one_manager(superclass, rel):
             instance_attr = self.field.get_foreign_related_value
             instances_dict = {instance_attr(inst): inst for inst in instances}
             query = {"%s__in" % self.field.name: instances}
-            queryset = queryset.filter(**query)
+            queryset = _filter_prefetch_queryset(queryset, Q(**query), self.field.name)
 
             # Since we just bypassed this class' get_queryset(), we must manage
             # the reverse relation manually.
@@ -1052,7 +1085,9 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
             queryset = queryset.using(queryset._db or self._db)
 
             query = {"%s__in" % self.query_field_name: instances}
-            queryset = queryset._next_is_sticky().filter(**query)
+            queryset = _filter_prefetch_queryset(
+                queryset._next_is_sticky(), Q(**query), self.query_field_name
+            )
 
             # M2M: need to annotate the query in order to get the primary model
             # that the secondary model was actually related to. We know that
